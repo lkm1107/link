@@ -1,86 +1,87 @@
 package link
 
-import "sync"
+import (
+	"sync"
+)
 
-// The channel type. Used to maintain a group of session. Normally used for broadcast classify purpose.
+type KEY interface{}
+
 type Channel struct {
-	server         *Server
-	mutex          sync.RWMutex
-	broadcastBuff  []byte
-	broadcastMutex sync.RWMutex
-	sessions       map[uint64]channelSession
+	mutex    sync.RWMutex
+	sessions map[KEY]*Session
+
+	// channel state
+	State interface{}
 }
 
-type channelSession struct {
-	*Session
-	KickCallback func()
-}
-
-// Create a channel instance.
-func (server *Server) NewChannel() *Channel {
+func NewChannel() *Channel {
 	return &Channel{
-		server:   server,
-		sessions: make(map[uint64]channelSession),
+		sessions: make(map[KEY]*Session),
 	}
 }
 
-// How mush sessions in this channel.
 func (channel *Channel) Len() int {
 	channel.mutex.RLock()
 	defer channel.mutex.RUnlock()
 	return len(channel.sessions)
 }
 
-// Join the channel. The kickClallback will called when the session kick out from the channel.
-func (channel *Channel) Join(session *Session, kickCallback func()) {
-	channel.mutex.Lock()
-	defer channel.mutex.Unlock()
-	channel.sessions[session.Id()] = channelSession{session, kickCallback}
-}
-
-// Exit the channel.
-func (channel *Channel) Exit(session *Session) {
-	channel.mutex.Lock()
-	defer channel.mutex.Unlock()
-	delete(channel.sessions, session.Id())
-}
-
-// Kick out a session from the channel.
-func (channel *Channel) Kick(sessionId uint64) {
-	channel.mutex.Lock()
-	defer channel.mutex.Unlock()
-	if session, exists := channel.sessions[sessionId]; exists {
-		delete(channel.sessions, sessionId)
-		if session.KickCallback != nil {
-			session.KickCallback()
-		}
-	}
-}
-
-// Fetch the sessions. NOTE: Invoke Kick() or Exit() in fetch callback will dead lock.
 func (channel *Channel) Fetch(callback func(*Session)) {
 	channel.mutex.RLock()
 	defer channel.mutex.RUnlock()
-	for _, sesssion := range channel.sessions {
-		callback(sesssion.Session)
+	for _, session := range channel.sessions {
+		callback(session)
 	}
 }
 
-// Broadcast to sessions. The message only encoded once
-// so the performance it's better then send message one by one.
-func (channel *Channel) Broadcast(message Message) {
-	channel.broadcastMutex.Lock()
-	defer channel.broadcastMutex.Unlock()
+func (channel *Channel) Get(key KEY) *Session {
+	channel.mutex.RLock()
+	defer channel.mutex.RUnlock()
+	session, _ := channel.sessions[key]
+	return session
+}
 
-	size := message.RecommendPacketSize()
-
-	packet := channel.server.writer.BeginPacket(size, channel.broadcastBuff)
-	packet = message.AppendToPacket(packet)
-	packet = channel.server.writer.EndPacket(packet)
-
-	channel.broadcastBuff = packet
-
-	channel.Fetch(func(session *Session) {
-		session.sendPacket(packet)
+func (channel *Channel) Put(key KEY, session *Session) {
+	channel.mutex.Lock()
+	defer channel.mutex.Unlock()
+	if session, exists := channel.sessions[key]; exists {
+		channel.remove(key, session)
+	}
+	session.AddCloseCallback(channel, key, func() {
+		channel.Remove(key)
 	})
+	channel.sessions[key] = session
+}
+
+func (channel *Channel) remove(key KEY, session *Session) {
+	session.RemoveCloseCallback(channel, key)
+	delete(channel.sessions, key)
+}
+
+func (channel *Channel) Remove(key KEY) bool {
+	channel.mutex.Lock()
+	defer channel.mutex.Unlock()
+	session, exists := channel.sessions[key]
+	if exists {
+		channel.remove(key, session)
+	}
+	return exists
+}
+
+func (channel *Channel) FetchAndRemove(callback func(*Session)) {
+	channel.mutex.Lock()
+	defer channel.mutex.Unlock()
+	for key, session := range channel.sessions {
+		session.RemoveCloseCallback(channel, key)
+		delete(channel.sessions, key)
+		callback(session)
+	}
+}
+
+func (channel *Channel) Close() {
+	channel.mutex.Lock()
+	defer channel.mutex.Unlock()
+	for key, session := range channel.sessions {
+		channel.remove(key, session)
+	}
 }
